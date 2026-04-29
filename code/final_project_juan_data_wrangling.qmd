@@ -1,0 +1,1593 @@
+---
+title: "final_project"
+format: html
+editor: visual
+---
+
+# Data wrangling
+
+## Training data
+
+### Ⅰ. Growing data
+
+#### 1. Set up
+
+##### 1.1 Install packages
+
+```{r}
+#| message: false
+#| warning: false
+
+#install.packages("nasapower")
+#install.packages("beepr")
+#install.packages("sf")
+#install.packages("rnaturalearthdata")
+#install.packages("daymetr")
+#install.packages("remotes")
+#remotes::install_github("ropensci/USAboundaries")
+#remotes::install_github("ropensci/USAboundariesData")
+#install.packages("soilDB")
+#install.packages("aqp")
+
+library(soilDB) # for pulling data from SoilGrid
+library(aqp)
+library(tidyverse)
+library(tidyr)
+library(janitor)
+library(tidymodels)
+library(xgboost)
+library(purrr)
+library(stringr)
+library(lubridate)
+library(nasapower)
+library(beepr)
+library(USAboundaries)
+library(sf)
+library(rnaturalearth)
+library(daymetr)
+```
+
+##### 1.2 Import taining data
+
+```{r}
+train_meta <- read_csv("../data/training_meta.csv")
+train_soil <- read_csv("../data/training_soil.csv")
+train_trait <- read_csv("../data/training_trait.csv")
+
+#glimpse(train_meta)
+#glimpse(train_soil)
+#glimpse(train_trait)
+```
+
+#### 2. EDA
+
+##### 2.1 Summary
+
+```{r}
+summary(train_meta)
+summary(train_soil)
+summary(train_trait)
+```
+
+##### 2.2 Distinct year, site, hybrid
+
+```{r}
+train_meta %>% distinct(year)
+train_soil %>% distinct(year)
+train_trait %>% distinct(year)
+
+train_meta %>% distinct(site)
+train_soil %>% distinct(site)
+train_trait %>% distinct(site)
+
+train_trait %>% distinct(hybrid)
+```
+
+There is 5,027 hybrids.
+
+##### 2.3 Check non-US site
+
+```{r}
+# check if all sites are in the US.
+
+# read US boundary
+usa <- ne_countries(
+  scale = "medium",
+  country = "United States of America",
+  returnclass = "sf"
+)
+
+# convert points to sf objects
+points <- train_meta %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# check whether points are within the US
+inside <- st_within(points, usa)
+
+# label results (clearer)
+train_meta_check <- train_meta %>%
+  mutate(in_us = lengths(inside) > 0)
+
+# view points not in the US
+not_in_us <- train_meta_check %>%
+  filter(!in_us)
+
+not_in_us
+```
+
+According to the latitude and longitude, GEH1, ONH1, and ONH2 are located outside the United States and would normally be excluded based on the assignment requirement to include only U.S. data. However, since the testing submission file includes the ONH3 site, which is located in Canada, ONH1 and ONH2 are retained in the training dataset for consistency.
+
+##### 2.4 Check plant and harvest timeline
+
+```{r}
+# check site(s) in train_data but not in test_data
+test_data <- read_csv("../output/test_data.csv")
+train_data <- read_csv("../output/train_data.csv")
+setdiff(unique(test_data$site), unique(train_data$site))
+
+# check plant and harvest date
+train_trait %>%
+  distinct(site, date_planted, date_harvested) %>%
+  arrange(site, date_planted)
+
+# check plant and harvest month
+site_window <- train_trait %>%
+  mutate(
+    date_planted   = mdy(date_planted),
+    date_harvested = mdy(date_harvested),
+    plant_month    = month(date_planted),
+    harvest_month  = month(date_harvested)
+  ) %>%
+  group_by(site) %>%
+  summarise(
+    plant_start   = floor(quantile(plant_month, 0.25, na.rm = TRUE)),
+    plant_end     = ceiling(quantile(plant_month, 0.75, na.rm = TRUE)),
+    harvest_start = floor(quantile(harvest_month, 0.25, na.rm = TRUE)),
+    harvest_end   = ceiling(quantile(harvest_month, 0.75, na.rm = TRUE)),
+    n_plant_na    = sum(is.na(plant_month)),
+    n_harvest_na  = sum(is.na(harvest_month)),
+    .groups = "drop"
+  )
+
+site_window
+```
+
+##### 2.5 Check A/B and B/A in hybrid
+
+```{r}
+hyb_check <- train_trait %>%
+  distinct(hybrid) %>%
+  separate(hybrid, into = c("p1", "p2"), sep = "/", remove = FALSE) %>%
+  mutate(rev = paste(p2, p1, sep = "/"))
+
+sum(hyb_check$rev %in% hyb_check$hybrid)
+
+test_trait_clean <- read_csv("../output/test_trait_clean.csv")
+train_trait_clean <- read_csv("../output/train_trait_clean.csv")
+
+# test: how many new hybrid
+ length(setdiff(unique(test_trait_clean$hybrid), unique(train_trait_clean$hybrid)))
+
+# overlap rate
+ length(intersect(unique(test_trait_clean$hybrid), unique(train_trait_clean$hybrid))) /
+ length(unique(test_trait_clean$hybrid))
+```
+
+There are 6 pairs that contain A/B and B/A in hybrid.
+
+Only 0.09783631 hybrid overlaps in train and test dataset.
+
+#### 3. Data cleaning
+
+##### 3.1 Clean train_soil
+
+```{r}
+train_soil_clean <- read_csv("../data/training_soil.csv") %>%
+  clean_names() %>%
+  rename(soil_ph = soilp_h) %>%
+  
+  # delete all duplicate rows
+  distinct() %>%
+  
+  # Remove year from site
+  mutate(
+    site_no_year = str_remove(site, "_\\d{4}$"),
+    site_base = str_remove(site_no_year, "_\\d+$")
+  ) %>%
+  
+  # Create a soil profile to check whether data are identical, within the same year and base site
+  mutate(
+    soil_profile = paste(soil_ph, om_pct, soilk_ppm, soilp_ppm, sep = " | ")
+  ) %>%
+  
+  # Within the same year and base site, check whether different replicates are identical
+  group_by(year, site_base) %>%
+  mutate(
+    n_profile = n_distinct(soil_profile),
+    site_final = if_else(n_profile == 1, site_base, site_no_year)
+  ) %>%
+  ungroup() %>%
+  
+  # Remove duplicated records again
+  distinct(year, site_final, soil_ph, om_pct, soilk_ppm, soilp_ppm, .keep_all = TRUE) %>%
+  
+  # Output final columns
+  transmute(
+    year,
+    site = site_final,
+    soil_ph,
+    om_pct,
+    soilk_ppm,
+    soilp_ppm
+  ) %>%
+  
+  # remove non-US site
+  filter(site != "GEH1") %>%
+  
+  arrange(desc(year), site)
+
+write_csv(train_soil_clean, "../output/train_soil_clean.csv")
+#train_soil_clean %>% filter(str_detect(site, "\\d{4}$"))
+#train_soil_clean %>% filter(str_detect(site, "^MOH1"))
+```
+
+##### 3.2 Clean train_trait
+
+```{r}
+train_trait_clean <- read_csv("../data/training_trait.csv") %>%
+  clean_names() %>%
+  
+  mutate(
+    site = str_replace(site, "^([A-Z0-9]+)[abc]$", "\\1"),
+    site = case_when(
+      site %in% c("TXH1-Dry", "TXH1-Early", "TXH1-Late") ~ "TXH1",
+      TRUE ~ site
+    ),
+    
+    date_planted = mdy(date_planted),
+    date_harvested = mdy(date_harvested),
+    
+    planted_month = month(date_planted, label = TRUE, abbr = TRUE),
+    harvested_month = month(date_harvested, label = TRUE, abbr = TRUE),
+    
+#    growing_days = as.numeric(date_harvested - date_planted),
+#    planted_doy = yday(date_planted),
+#    harvested_doy = yday(date_harvested),
+  ) %>%
+  
+   separate(hybrid, into = c("parent1", "parent2"), sep = "/", remove = FALSE) %>%
+  
+#  dplyr::select(
+#    year, site, 
+#    hybrid, parent1, parent2, 
+#    planted_month, harvested_month,
+#    yield_mg_ha # No grain_moisture info in the predict-dataset + it seems highly related to yield ==> it is excluded.
+#  ) %>%
+  
+  # remove non-US site
+  filter(site != "GEH1") %>%
+  
+    # aggregate replicate and block
+  group_by(year, site, hybrid) %>%
+  summarise(
+    parent1 = first(parent1), 
+    parent2 = first(parent2), 
+    planted_month = first(planted_month),
+    harvested_month = first(harvested_month),
+    yield_mg_ha_mean = mean(yield_mg_ha, na.rm = TRUE),
+#    n_rep = n(),
+#    yield_sd = sd(yield_mg_ha, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(yield_mg_ha_mean = round(yield_mg_ha_mean, 2))%>%
+  
+  arrange(desc(year), site, hybrid)
+
+#train_trait %>%
+#  group_by(year, site, hybrid) %>%
+#  summarise(sd = sd(yield_mg_ha, na.rm = TRUE)) %>%
+#  summarise(mean_sd = mean(sd, na.rm = TRUE))
+
+#train_trait_clean %>%
+#  group_by(hybrid) %>%
+#  summarise(sd_between = sd(yield_mg_ha, na.rm = TRUE))
+
+write_csv(train_trait_clean, "../output/train_trait_clean.csv")
+```
+
+##### 3.3 Clean train_meta
+
+```{r}
+train_meta_clean <- read_csv("../data/training_meta.csv") %>%
+  clean_names() %>%
+  
+  mutate(
+    # lowercase
+    previous_crop = tolower(previous_crop),
+    # clean crop
+    previous_crop = case_when(
+      is.na(previous_crop) ~ NA_character_,
+      str_detect(previous_crop, "soy") ~ "soybean",
+      str_detect(previous_crop, "corn") ~ "corn",
+      str_detect(previous_crop, "wheat") ~ "wheat",
+      str_detect(previous_crop, "cotton") ~ "cotton",
+      str_detect(previous_crop, "sorghum") ~ "sorghum",
+      str_detect(previous_crop, "lima") ~ "lima bean",
+      str_detect(previous_crop, "cereal") ~ "cereal rye",
+      str_detect(previous_crop, "fallow") ~ "fallow",
+      str_detect(previous_crop, "peanut") ~ "peanut",
+      str_detect(previous_crop, "beet") ~ "sugar beet",
+      TRUE ~ "other"
+    ),
+    # combine rows with repeated sites
+    site = case_when(
+      site %in% c("TXH1- Dry", "TXH1- Early", "TXH1- Late") ~ "TXH1", 
+      site %in% c("MOH1- rep 1", "MOH1- rep 2") ~ "MOH1",
+      TRUE ~ site
+    )
+  ) %>%
+ 
+  # remove repeated rows
+  distinct(year, site, previous_crop, longitude, latitude, .keep_all = TRUE) %>%
+  # average location info within repeated sites
+  group_by(year, site, previous_crop) %>%
+  summarise(
+    longitude = mean(longitude, na.rm = TRUE),
+    latitude = mean(latitude, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  
+  # remove non-US site
+  filter(site != "GEH1") %>%
+  
+  arrange(desc(year), site)
+
+write_csv(train_meta_clean, "../output/train_meta_clean.csv")
+#train_meta_clean %>% count(previous_crop, sort = TRUE)
+#train_meta_clean %>% count(site, year) %>% filter(n > 1)
+```
+
+### Ⅱ. Weather data
+
+#### 1. Import data from Daymet
+
+##### 1.1 Find complete site, year info
+
+```{r}
+# Pull site-year info from train_trait_clean
+full_site_year <- train_trait_clean %>%
+  distinct(site, year)
+
+full_site_year
+
+# Pull site-year-specific coordinates from train_meta_clean
+site_coord <- train_meta_clean %>%
+  select(site, year, latitude, longitude) %>%
+  distinct(site, year, .keep_all = TRUE)
+
+site_coord
+
+# Merge by both site and year
+full_site_year_coord <- full_site_year %>%
+  left_join(site_coord, by = c("site", "year"))
+
+full_site_year_coord
+```
+
+```{r}
+# missing site-year in trait but not in meta
+missing_site_year <- full_site_year %>%
+  anti_join(site_coord, by = c("site", "year"))
+
+missing_site_year
+```
+
+```{r}
+missing_site_coord_candidates <- train_meta_clean %>%
+  semi_join(missing_site_year %>% distinct(site), by = "site") %>%
+  select(site, year, latitude, longitude) %>%
+  arrange(site, year)
+
+missing_site_coord_candidates
+```
+
+```{r}
+# Based on site not year
+site_mean_coord <- train_meta_clean %>%
+  group_by(site) %>%
+  summarise(
+    lat_mean = mean(latitude, na.rm = TRUE),
+    lon_mean = mean(longitude, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Merge and fill in NAs
+full_site_year_coord_filled <- full_site_year_coord %>%
+  left_join(site_mean_coord, by = "site") %>%
+  mutate(
+    latitude  = if_else(is.na(latitude),  lat_mean, latitude),
+    longitude = if_else(is.na(longitude), lon_mean, longitude)
+  ) %>%
+  select(site, year, latitude, longitude)
+
+full_site_year_coord_filled
+
+# Check if there is still NA or not
+full_site_year_coord_filled %>% filter(is.na(latitude) | is.na(longitude))
+```
+
+```{r}
+# Check all TXH coordinate info
+train_meta_clean %>%
+  filter(str_detect(site, "TXH")) %>%
+  arrange(site, year)
+```
+
+```{r}
+# Create TXH4 coordinate
+txh_coord <- train_meta_clean %>%
+  filter(str_detect(site, "TXH")) %>%
+  filter(longitude > -100) %>%  # remove 2014 TXH2 (seems like outlier)
+  summarise(
+    lat = mean(latitude),
+    lon = mean(longitude)
+  )
+
+txh_coord
+```
+
+```{r}
+full_site_year_coord_complete <- full_site_year_coord_filled %>%
+  mutate(
+    latitude  = if_else(site == "TXH4", txh_coord$lat, latitude),
+    longitude = if_else(site == "TXH4", txh_coord$lon, longitude)
+  )
+
+full_site_year_coord_complete
+```
+
+```{r}
+train_meta_clean %>%
+  group_by(site, year) %>%
+  summarise(n_crop = n_distinct(previous_crop)) %>%
+  filter(n_crop > 1)
+```
+
+```{r}
+meta_crop <- train_meta_clean %>%
+  select(site, year, previous_crop) %>%
+  distinct(site, year, .keep_all = TRUE)
+meta_crop
+
+full_data <- full_site_year_coord_complete %>%
+  left_join(meta_crop, by = c("site", "year"))
+full_data
+```
+
+##### 1.2 Pull weather data
+
+```{r}
+# help("download_daymet")
+
+# full_data_daym <- full_data %>%
+#  mutate(
+#    weather = pmap(
+#      list(year, site, latitude, longitude),
+#     function(.y, .site, .lat, .lon) {
+#        download_daymet(
+#         site = .site,
+        #   lat = .lat,
+        #   lon = .lon,
+        #   start = .y,
+        #   end = .y,
+        #   simplify = TRUE,
+        #   silent = TRUE
+        # ) %>%
+        #   rename(
+        #     weather_year = year,
+        #     weather_site = site,
+        #     weather_latitude = latitude,
+        #     weather_longitude = longitude
+ #        #   )
+ #      }
+ #    )
+ #  ) %>%
+ #  unnest(weather) %>%
+ #  pivot_wider(names_from = measurement,
+ #              values_from = value
+ #              ) %>%
+ #  janitor::clean_names()
+ # 
+ # full_data_daym
+
+ # write_csv(full_data_daym, "../data/full_data_daym.csv")
+
+weather_tain <- read_csv("../data/full_data_daym.csv")
+```
+
+-   Variables included:
+    -   day length (secs/day)\
+    -   precipitation (mm/day)\
+    -   shortwave radiation (W/m2)\
+    -   snow water equivalent (kg/m2)\
+    -   maximum air temperature (C)\
+    -   minimum air temperature (C)\
+    -   water vapor pressure (Pa)
+
+#### 2. EDA
+
+```{r}
+# overview
+summary(weather_tain)
+
+# density plot to see distribution
+weather_tain %>%
+  pivot_longer(cols = dayl_s:vp_pa) %>%
+  ggplot(aes(x = value)) +
+  geom_density() +
+  facet_wrap(~name, scales = "free")
+```
+
+#### 3. Feature engineering
+
+##### 3.1 Fix grow month
+
+Since planting and harvest date information is not available in the testing dataset, it is difficult to directly align weather data with the actual growing season. To address this, I summarize the range of planting and harvest months for each site using the training data. Specifically, I use the minimum planting month as the start of the growing period and the maximum harvest month as the end. These site-specific month ranges are then used to extract and aggregate weather data for both the training and testing datasets. I assume that this time period reasonably represents the growing season for corn in the testing data.
+
+```{r}
+month_levels <- c("Jan","Feb","Mar","Apr","May","Jun",
+                  "Jul","Aug","Sep","Oct","Nov","Dec")
+
+grow_month <- train_trait_clean %>%
+  mutate(
+    planted_month   = str_trim(str_to_title(planted_month)),
+    harvested_month = str_trim(str_to_title(harvested_month)),
+    plant_mon_num   = match(planted_month, month_levels),
+    harvest_mon_num = match(harvested_month, month_levels)
+  ) %>%
+  group_by(site) %>%
+  summarise(
+    start_mon = month_levels[min(plant_mon_num, na.rm = TRUE)],
+    end_mon   = month_levels[max(harvest_mon_num, na.rm = TRUE)],
+    .groups = "drop"
+  )
+
+grow_month
+
+write_csv(grow_month, "../output/grow_month.csv")
+```
+
+##### 3.2 Merge grow month with weather data
+
+```{r}
+weather_tain_grow <- weather_tain %>%
+  left_join(grow_month, by = "site") %>%
+  dplyr::select(year, site, previous_crop, start_mon, end_mon, everything())
+
+weather_tain_grow
+
+setdiff(unique(weather_tain_grow$site), unique(grow_month$site))
+```
+
+##### 3.3 Create month column for weather info
+
+```{r}
+weather_tain_month <- weather_tain_grow %>%
+  # Selecting needed variables
+  dplyr::select(year, site, previous_crop, 
+                start_mon, end_mon,
+                latitude, longitude,
+                yday,
+                dayl.s = dayl_s, 
+                prcp.mm = prcp_mm_day,
+                srad.wm2 = srad_w_m_2,
+                tmax.c = tmax_deg_c, 
+                tmin.c = tmin_deg_c,
+                vp.pa = vp_pa
+                ) %>%
+  # Creating a date class variable
+  mutate(date_chr = paste0(year,"/",yday)) %>% 
+  mutate(date = as.Date(date_chr, "%Y/%j")) %>%
+  # Extracting month from date  
+  mutate(month = month(date)) %>%
+  mutate(month_abb = month(date, label = T)) %>%
+  # calculate GDD
+  mutate(
+    tmean = (tmax.c + tmin.c) / 2,
+    gdd = pmax(tmean - 10, 0) # T-base: 10 for corn https://fieldreport.caes.uga.edu/publications/C1320/growing-degree-days-for-sweet-corn-in-southern-georgia/
+    )
+
+weather_tain_month
+```
+
+##### 3.4 Cut growing season into 4 stages
+
+```{r}
+month_levels <- c("Jan","Feb","Mar","Apr","May","Jun",
+                  "Jul","Aug","Sep","Oct","Nov","Dec")
+
+weather_stage <- weather_tain_month %>%
+  mutate(
+    month_abb = factor(as.character(month_abb), levels = month_levels, ordered = TRUE),
+    start_mon = factor(start_mon, levels = month_levels, ordered = TRUE),
+    end_mon   = factor(end_mon, levels = month_levels, ordered = TRUE)
+  ) %>%
+  filter(month_abb >= start_mon & month_abb <= end_mon) %>%
+  group_by(year, site) %>%
+  mutate(stage = ntile(yday, 4)) %>%
+  ungroup() 
+
+weather_stage
+```
+
+##### 3.5 Summarize daily weather variables based on growing stage
+
+```{r}
+weather_tain_month_sum <- weather_stage %>%
+    mutate(
+    month_abb = factor(as.character(month_abb), levels = month_levels, ordered = TRUE),
+    start_mon = factor(start_mon, levels = month_levels, ordered = TRUE),
+    end_mon   = factor(end_mon, levels = month_levels, ordered = TRUE)
+  ) %>%
+  filter(month_abb >= start_mon & month_abb <= end_mon) %>% 
+  group_by(year, site, previous_crop, stage) %>%
+  summarise(across(.cols = c(dayl.s,
+                             srad.wm2,
+                             tmax.c,
+                             tmin.c,
+                             vp.pa
+                             ),
+                   .fns = mean,
+                   .names = "mean_{.col}"
+                   ),
+            across(.cols = c(prcp.mm, gdd),
+                   .fns = sum,
+                   .names = "sum_{.col}"
+                   )
+            ) %>%
+  ungroup()
+
+weather_tain_month_sum
+```
+
+##### 3.6 Verify the calculation
+
+```{r}
+weather_stage %>%
+  filter(year == 2014 & 
+           site == "DEH1" &
+           previous_crop == "soybean" &
+           stage == 1) %>%
+  summarise(tmax.c = mean(tmax.c),
+            prcp.mm = sum(prcp.mm))
+```
+
+##### 3.7 Include stage in the column name
+
+```{r}
+weather_tain_month_sum_wide <- weather_tain_month_sum %>%
+  pivot_longer(mean_dayl.s:sum_gdd) %>%
+  mutate(varname = paste0(name, "_stage",stage)) %>%
+  dplyr::select(-name, -stage) %>%
+  pivot_wider(names_from = varname,
+              values_from = value) %>%
+  # Rounding to one decimal point
+  mutate(across(where(is.numeric), 
+                ~round(.,2)
+                )
+         ) 
+
+weather_tain_month_sum_wide
+
+write_csv(weather_tain_month_sum_wide, "../output/weather_tain_month_sum_wide.csv")
+```
+
+### Ⅲ. Soil data
+
+#### 1. Create full soil info
+
+```{r}
+train_soil_full <- full_data %>%
+  select(-previous_crop) %>%
+  left_join(train_soil_clean, by = c("site", "year"))
+
+train_soil_full
+```
+
+#### 2. Check the missing info
+
+```{r}
+# area
+train_soil_full %>%
+  summarise(
+    om_pct_na = sum(is.na(om_pct)),
+    soil_ph_na = sum(is.na(soil_ph)),
+    soilk_ppm_na = sum(is.na(soilk_ppm)),
+    soilp_ppm_na = sum(is.na(soilp_ppm))
+  )
+
+# line
+train_soil_full %>%
+  filter(
+    is.na(om_pct) |
+    is.na(soil_ph) |
+    is.na(soilk_ppm) |
+    is.na(soilp_ppm)
+  )
+```
+
+#### 3. Keep only the site-years that were pulled
+
+```{r}
+train_soil_needpull <- train_soil_full %>%
+  filter(
+    is.na(om_pct) |
+    is.na(soil_ph) |
+    is.na(soilk_ppm) |
+    is.na(soilp_ppm)
+  ) %>% distinct(site, latitude, longitude)
+
+train_soil_needpull
+```
+
+#### 4. Pull data from SoilGrid
+
+```{r}
+glimpse(train_soil_needpull)
+
+summary(train_soil_needpull$latitude)
+summary(train_soil_needpull$longitude)
+
+train_soil_needpull %>% 
+  filter(is.na(latitude) | is.na(longitude))
+```
+
+```{r}
+# # SoilGrids pull
+#  sg_input_train <- train_soil_needpull %>%
+#    filter(!is.na(latitude), !is.na(longitude)) %>%
+#    distinct(latitude, longitude) %>%
+#    mutate(id = paste0("pt_", row_number())) %>%
+#    select(id, latitude, longitude)
+# 
+#  soilgrid_raw_train <- fetchSoilGrids(
+#    x = sg_input_train,
+#    loc.names = c("id", "latitude", "longitude"),
+#    variables = c("phh2o", "soc"),
+#    depth_intervals = "0-5"
+#  )
+
+```
+
+#### 5. Organize data
+
+```{r}
+# names(soilgrid_raw_train)
+```
+
+```{r}
+#h <- horizons(soilgrid_raw_train) %>% as.data.frame()
+# s <- site(soilgrid_raw_train) %>% as.data.frame()
+# 
+# names(s)
+# names(h)
+```
+
+```{r}
+# Find column name
+# soilgrid_fill_train <- s %>%
+#   left_join(
+#     h %>%
+#       select(id, phh2omean, socmean),
+#     by = "id"
+#   ) %>%
+#   transmute(
+#     latitude,
+#     longitude,
+#     soil_ph_sg = phh2omean,
+#     om_pct_sg = socmean * 0.1724
+#   )
+# 
+# soilgrid_fill_train 
+# 
+# write_csv(soilgrid_fill_train, "../output/soilgrid_fill_train.csv")
+```
+
+#### 6. Merge back
+
+```{r}
+soilgrid_fill_train <- read_csv("../output/soilgrid_fill_train.csv")
+
+train_soil_filled <- train_soil_full %>%
+  left_join(soilgrid_fill_train, by = c("latitude", "longitude")) %>%
+  mutate(
+    soil_ph = coalesce(soil_ph, soil_ph_sg),
+    om_pct  = coalesce(om_pct, om_pct_sg)
+  ) %>%
+  select(-soil_ph_sg, -om_pct_sg, -latitude, -longitude)
+
+train_soil_filled
+```
+
+```{r}
+# check NAs
+train_soil_filled %>%
+  summarise(
+    soil_ph_na = sum(is.na(soil_ph)),
+    om_pct_na  = sum(is.na(om_pct)),
+    soilk_ppm_na = sum(is.na(soilk_ppm)),
+    soilp_ppm_na = sum(is.na(soilp_ppm))
+  )
+```
+
+```{r}
+# label ones with SoilGrid data
+
+# train_soil_filled <- train_soil_full %>%
+#   left_join(soilgrid_fill, by = c("latitude", "longitude")) %>%
+#   mutate(
+#     soil_ph_from_sg = as.integer(is.na(soil_ph) & !is.na(soil_ph_sg)),
+#     om_pct_from_sg  = as.integer(is.na(om_pct)  & !is.na(om_pct_sg)),
+#     soil_ph = coalesce(soil_ph, soil_ph_sg),
+#     om_pct  = coalesce(om_pct, om_pct_sg)
+#   ) %>%
+#   select(-soil_ph_sg, -om_pct_sg)
+# 
+# train_soil_filled
+```
+
+```{r}
+# remove the number after site. use the mean value to fill calculated from the same base site 
+# train_soil_filled2 <- train_soil_filled %>%
+#   mutate(
+#     site_base = str_remove(site, "\\d+$")
+#   ) %>%
+#   group_by(site_base) %>%
+#   mutate(
+#     soilk_base_mean = mean(soilk_ppm, na.rm = TRUE),
+#     soilp_base_mean = mean(soilp_ppm, na.rm = TRUE)
+#   ) %>%
+#   ungroup() %>%
+#   mutate(
+#     soilk_ppm = if_else(
+#       is.na(soilk_ppm) & is.finite(soilk_base_mean),
+#       soilk_base_mean,
+#       soilk_ppm
+#     ),
+#     soilp_ppm = if_else(
+#       is.na(soilp_ppm) & is.finite(soilp_base_mean),
+#       soilp_base_mean,
+#       soilp_ppm
+#     )
+#   ) %>%
+#   select(-site_base, -soilk_base_mean, -soilp_base_mean)
+# 
+# train_soil_filled2
+```
+
+```{r}
+# train_soil_filled2 %>%
+#   summarise(
+#     soilk_ppm_na = sum(is.na(soilk_ppm)),
+#     soilp_ppm_na = sum(is.na(soilp_ppm))
+#   )
+```
+
+```{r}
+# # Verify if at least one filled value is from the real value fro the same group
+# train_soil_filled %>%
+#   mutate(site_base = str_remove(site, "\\d+$")) %>%
+#   group_by(site_base) %>%
+#   summarise(
+#     n_site = n(),
+#     n_soilk_non_na = sum(!is.na(soilk_ppm)),
+#     n_soilp_non_na = sum(!is.na(soilp_ppm))
+#   ) %>%
+#   arrange(n_soilk_non_na, n_soilp_non_na)
+```
+
+```{r}
+# # To check which site was missing but now is filled
+# train_soil_compare <- train_soil_filled %>%
+#   select(site, year, soilk_ppm_old = soilk_ppm, soilp_ppm_old = soilp_ppm) %>%
+#   left_join(
+#     train_soil_filled2 %>%
+#       select(site, year, soilk_ppm_new = soilk_ppm, soilp_ppm_new = soilp_ppm),
+#     by = c("site", "year")
+#   ) %>%
+#   filter(
+#     (is.na(soilk_ppm_old) & !is.na(soilk_ppm_new)) |
+#     (is.na(soilp_ppm_old) & !is.na(soilp_ppm_new))
+#   )
+# 
+# train_soil_compare
+```
+
+### IV. Merge data
+
+#### 1. Check difference
+
+```{r}
+train_soil_filled %>% count(site, year) %>% filter(n > 1)
+train_meta_clean %>% count(site, year) %>% filter(n > 1)
+weather_tain_month_sum_wide %>% count(site, year) %>% filter(n > 1)
+
+setdiff(train_trait_clean$site, weather_tain_month_sum_wide$site)
+setdiff(train_trait_clean$site, train_soil_filled$site)
+setdiff(train_trait_clean$year, weather_tain_month_sum_wide$year)
+setdiff(train_trait_clean$year, train_soil_filled$year)
+```
+
+#### 2. Left join
+
+```{r}
+train_data <- train_trait_clean %>%
+  left_join(weather_tain_month_sum_wide, by = c("site", "year")) %>%
+  left_join(train_soil_filled, by = c("site", "year")) %>%
+  dplyr::select(-planted_month, -harvested_month, -hybrid)
+
+train_data
+write_csv(train_data, "../output/train_data.csv")
+```
+
+#### 3. Check merged data
+
+```{r}
+# check row numbers
+nrow(train_trait_clean)
+nrow(train_data)
+
+# check if there is repeatedly join
+weather_tain_month_sum_wide %>%
+  count(site, year) %>%
+  filter(n > 1)
+
+train_soil_clean %>%
+  count(site, year) %>%
+  filter(n > 1)
+
+# check NA
+train_data %>%
+  summarise(
+    n_weather_na = sum(is.na(mean_dayl.s_stage1)),
+    n_soil_na = sum(is.na(soil_ph))
+  )
+# check which specific sites have problem
+train_data %>%
+  filter(is.na(soil_ph)) %>%
+  distinct(site, year)
+```
+
+## Testing data
+
+### Ⅰ. Growing data
+
+#### 1. Set up
+
+##### 1.1 Import taining data
+
+```{r}
+test_meta <- read_csv("../data/testing_meta.csv")
+test_soil <- read_csv("../data/testing_soil.csv")
+test_trait <- read_csv("../data/testing_submission.csv")
+
+#glimpse(test_meta)
+#glimpse(test_soil)
+#glimpse(test_trait)
+```
+
+#### 2. EDA
+
+##### 2.1 Summary
+
+```{r}
+summary(test_meta)
+summary(test_soil)
+summary(test_trait)
+```
+
+##### 2.2 Distinct year and site
+
+```{r}
+test_meta %>% distinct(year)
+test_soil %>% distinct(year)
+test_trait %>% distinct(year)
+
+test_meta %>% distinct(site)
+test_soil %>% distinct(site)
+test_trait %>% distinct(site)
+
+test_trait %>% distinct(hybrid)
+```
+
+##### 2.3 Check non-US site
+
+```{r}
+# check if all sites are in the US.
+
+# read US boundary
+usa <- ne_countries(
+  scale = "medium",
+  country = "United States of America",
+  returnclass = "sf"
+)
+
+# convert points to sf objects
+points <- test_meta %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# check whether points are within the US
+inside <- st_within(points, usa)
+
+# label results (clearer)
+test_meta_check <- test_meta %>%
+  mutate(in_us = lengths(inside) > 0)
+
+# view points not in the US
+not_in_us <- test_meta_check %>%
+  filter(!in_us)
+
+not_in_us
+
+```
+
+According to the latitude and longitude, ONH3 is located outside the United States.
+
+##### 2.4 Check A/B and B/A in hybrid
+
+```{r}
+hyb_check <- test_trait %>%
+  distinct(hybrid) %>%
+  separate(hybrid, into = c("p1", "p2"), sep = "/", remove = FALSE) %>%
+  mutate(rev = paste(p2, p1, sep = "/"))
+
+sum(hyb_check$rev %in% hyb_check$hybrid)
+```
+
+There are 2 pairs that contain A/B and B/A in hybrid.
+
+#### 3. Data cleaning
+
+##### 3.1 Clean test_soil
+
+```{r}
+test_soil_clean <- read_csv("../data/testing_soil.csv") %>%
+  clean_names() %>%
+  rename(soil_ph = soilp_h) %>%
+  mutate(
+    site = str_remove(site, "_\\d{4}$")
+  ) %>%
+  group_by(year, site) %>%
+  summarise(
+    soil_ph   = mean(soil_ph, na.rm = TRUE),
+    om_pct    = mean(om_pct, na.rm = TRUE),
+    soilk_ppm = mean(soilk_ppm, na.rm = TRUE),
+    soilp_ppm = mean(soilp_ppm, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(c(soil_ph, om_pct, soilk_ppm, soilp_ppm), ~ round(., 2))) %>%
+  arrange(desc(year), site)
+
+test_soil_clean
+
+write_csv(test_soil_clean, "../output/test_soil_clean.csv")
+test_soil_clean %>% filter(str_detect(site, "\\d{4}$"))
+```
+
+##### 3.2 Clean train_trait
+
+```{r}
+test_trait_clean <- read_csv("../data/testing_submission.csv") %>%
+  clean_names() %>%
+  separate(hybrid, into = c("parent1", "parent2"), sep = "/", remove = FALSE) %>%
+  dplyr::select(-yield_mg_ha)
+
+test_trait_clean
+
+write_csv(test_trait_clean, "../output/test_trait_clean.csv")
+```
+
+##### 3.3 Clean train_meta
+
+```{r}
+test_meta_clean <- read_csv("../data/testing_meta.csv") %>%
+  clean_names() %>%
+  
+  mutate(previous_crop = tolower(previous_crop))
+
+test_meta_clean
+
+write_csv(train_meta_clean, "../output/train_meta_clean.csv")
+train_meta_clean %>% count(previous_crop, sort = TRUE)
+train_meta_clean %>% count(site, year) %>% filter(n > 1)
+```
+
+### Ⅱ. Weather data
+
+#### 1. Import data from Daymet
+
+```{r}
+# help("download_daymet")
+
+# test_meta_clean_daym <- test_meta_clean %>%
+#  mutate(
+#    weather = pmap(
+#      list(year, site, latitude, longitude),
+#     function(.y, .site, .lat, .lon) {
+#        download_daymet(
+#         site = .site,
+#          lat = .lat,
+#          lon = .lon,
+#          start = .y,
+#          end = .y,
+#          simplify = TRUE,
+#          silent = TRUE
+#        ) %>%
+#          rename(
+#            weather_year = year,
+#            weather_site = site,
+#            weather_latitude = latitude,
+#            weather_longitude = longitude
+#          )
+#      }
+#    )
+#  ) %>%
+#  unnest(weather) %>%
+#  pivot_wider(names_from = measurement,
+#              values_from = value
+#              ) %>%
+#  janitor::clean_names()
+
+# test_meta_clean_daym
+
+# write_csv(test_meta_clean_daym, "../data/test_meta_clean_daym.csv")
+
+weather_test <- read_csv("../data/test_meta_clean_daym.csv")
+```
+
+#### 2. EDA
+
+```{r}
+# overview
+summary(weather_test)
+
+# density plot to see distribution
+weather_test %>%
+  pivot_longer(cols = dayl_s:vp_pa) %>%
+  ggplot(aes(x = value)) +
+  geom_density() +
+  facet_wrap(~name, scales = "free")
+```
+
+#### 3. Feature engineering
+
+##### 3.1 Fix grow month
+
+Since planting and harvest date information is not available in the testing dataset, it is difficult to directly align weather data with the actual growing season. To address this, I summarize the range of planting and harvest months for each site using the training data. Specifically, I use the minimum planting month as the start of the growing period and the maximum harvest month as the end. These site-specific month ranges are then used to extract and aggregate weather data for both the training and testing datasets. I assume that this time period reasonably represents the growing season for corn in the testing data.
+
+```{r}
+grow_month_test <- grow_month %>%
+  bind_rows(
+    tibble(
+      site = "ONH3",
+      start_mon = "Apr",
+      end_mon = "Nov"
+    )
+  )
+
+grow_month_test
+```
+
+##### 3.2 Merge grow month with weather data
+
+```{r}
+
+weather_test_grow <- weather_test %>%
+  left_join(grow_month_test, by = "site") %>%
+  dplyr::select(year, site, previous_crop, start_mon, end_mon, everything())
+
+weather_test_grow
+
+write_csv(weather_test_grow, "../output/weather_test_grow.csv")
+
+setdiff(unique(weather_test_grow$site), unique(grow_month$site))
+```
+
+##### 3.3 Create month column for weather info
+
+```{r}
+weather_test_month <- weather_test_grow %>%
+  # Selecting needed variables
+  dplyr::select(year, site, previous_crop, 
+                start_mon, end_mon,
+                latitude, longitude,
+                yday,
+                dayl.s = dayl_s, 
+                prcp.mm = prcp_mm_day,
+                srad.wm2 = srad_w_m_2,
+                tmax.c = tmax_deg_c, 
+                tmin.c = tmin_deg_c,
+                vp.pa = vp_pa
+                ) %>%
+  # Creating a date class variable
+  mutate(date_chr = paste0(year,"/",yday)) %>% 
+  mutate(date = as.Date(date_chr, "%Y/%j")) %>%
+  # Extracting month from date  
+  mutate(month = month(date)) %>%
+  mutate(month_abb = month(date, label = T)) %>%
+  # calculate GDD
+  mutate(
+    tmean = (tmax.c + tmin.c) / 2,
+    gdd = pmax(tmean - 10, 0) # T-base: 10 for corn https://fieldreport.caes.uga.edu/publications/C1320/growing-degree-days-for-sweet-corn-in-southern-georgia/
+    )
+
+weather_test_month
+```
+
+##### 3.4 Cut growing season into 4 stages
+
+```{r}
+month_levels <- c("Jan","Feb","Mar","Apr","May","Jun",
+                  "Jul","Aug","Sep","Oct","Nov","Dec")
+
+weather_stage_test <- weather_test_month %>%
+  mutate(
+    month_abb = factor(as.character(month_abb), levels = month_levels, ordered = TRUE),
+    start_mon = factor(start_mon, levels = month_levels, ordered = TRUE),
+    end_mon   = factor(end_mon, levels = month_levels, ordered = TRUE)
+  ) %>%
+  filter(month_abb >= start_mon & month_abb <= end_mon) %>%
+  group_by(year, site) %>%
+  mutate(stage = ntile(yday, 4)) %>%
+  ungroup() 
+
+weather_stage_test
+```
+
+##### 3.5 Summarize daily weather variables based on growing stage
+
+```{r}
+weather_test_month_sum <- weather_stage_test %>%
+    mutate(
+    month_abb = factor(as.character(month_abb), levels = month_levels, ordered = TRUE),
+    start_mon = factor(start_mon, levels = month_levels, ordered = TRUE),
+    end_mon   = factor(end_mon, levels = month_levels, ordered = TRUE)
+  ) %>%
+  filter(month_abb >= start_mon & month_abb <= end_mon) %>% 
+  group_by(year, site, previous_crop, stage) %>%
+  summarise(across(.cols = c(dayl.s,
+                             srad.wm2,
+                             tmax.c,
+                             tmin.c,
+                             vp.pa
+                             ),
+                   .fns = mean,
+                   .names = "mean_{.col}"
+                   ),
+            across(.cols = c(prcp.mm, gdd),
+                   .fns = sum,
+                   .names = "sum_{.col}"
+                   )
+            ) %>%
+  ungroup()
+
+weather_test_month_sum
+```
+
+##### 3.6 Verify the calculation
+
+```{r}
+weather_stage_test %>%
+  filter(year == 2024 & 
+           site == "DEH1" &
+           previous_crop == "soybean" &
+           stage == 1) %>%
+  summarise(tmax.c = mean(tmax.c),
+            prcp.mm = sum(prcp.mm))
+```
+
+##### 3.7 Include stage in the column name
+
+```{r}
+weather_test_month_sum_wide <- weather_test_month_sum %>%
+  pivot_longer(mean_dayl.s:sum_gdd) %>%
+  mutate(varname = paste0(name, "_stage",stage)) %>%
+  dplyr::select(-name, -stage) %>%
+  pivot_wider(names_from = varname,
+              values_from = value) %>%
+  # Rounding to one decimal point
+  mutate(across(where(is.numeric), 
+                ~round(.,2)
+                )
+         ) 
+
+weather_test_month_sum_wide
+
+write_csv(weather_test_month_sum_wide, "../output/weather_test_month_sum_wide.csv")
+```
+
+### Ⅲ. Soil data
+
+#### 1. Create full soil info
+
+```{r}
+# check which site and year only in test_trait not in test_meta
+test_trait_clean %>% 
+  anti_join(test_meta_clean, by = c("year", "site"))
+
+# check if there is extra info in meta
+test_meta_clean %>% 
+  anti_join(test_trait_clean, by = c("year", "site"))
+```
+
+```{r}
+test_soil_full <- test_meta_clean %>%
+  left_join(
+    test_soil_clean,
+    by = c("year", "site")
+  ) %>%
+   dplyr::select(-previous_crop)
+
+test_soil_full
+```
+
+#### 2. Check the missing info
+
+```{r}
+# area
+test_soil_full %>%
+  summarise(
+    om_pct_na = sum(is.na(om_pct)),
+    soil_ph_na = sum(is.na(soil_ph)),
+    soilk_ppm_na = sum(is.na(soilk_ppm)),
+    soilp_ppm_na = sum(is.na(soilp_ppm))
+  )
+
+# line
+test_soil_full %>%
+  filter(
+    is.na(om_pct) |
+    is.na(soil_ph) |
+    is.na(soilk_ppm) |
+    is.na(soilp_ppm)
+  )
+```
+
+#### 3. Keep only the site-years that were pulled
+
+```{r}
+test_soil_needpull <- test_soil_full %>%
+  filter(
+    is.na(om_pct) |
+    is.na(soil_ph) |
+    is.na(soilk_ppm) |
+    is.na(soilp_ppm)
+  ) %>% distinct(site, latitude, longitude)
+
+test_soil_needpull
+```
+
+#### 4. Pull data from SoilGrid
+
+```{r}
+glimpse(test_soil_needpull)
+
+summary(test_soil_needpull$latitude)
+summary(test_soil_needpull$longitude)
+
+test_soil_needpull %>% 
+  filter(is.na(latitude) | is.na(longitude))
+```
+
+```{r}
+# SoilGrids pull
+# sg_input <- test_soil_needpull %>%
+#   filter(!is.na(latitude), !is.na(longitude)) %>%
+#   distinct(latitude, longitude) %>%
+#   mutate(id = paste0("pt_", row_number())) %>%
+#   select(id, latitude, longitude)
+# 
+# soilgrid_raw <- fetchSoilGrids(
+#   x = sg_input,
+#   loc.names = c("id", "latitude", "longitude"),
+#   variables = c("phh2o", "soc"),
+#   depth_intervals = "0-5"
+# )
+
+```
+
+#### 5. Organize data
+
+```{r}
+# names(soilgrid_raw)
+```
+
+```{r}
+# h <- horizons(soilgrid_raw) %>% as.data.frame()
+# s <- site(soilgrid_raw) %>% as.data.frame()
+# 
+# names(s)
+# names(h)
+```
+
+```{r}
+# soilgrid_fill_test  <- s %>%
+#   left_join(
+#     h %>%
+#       select(id, phh2omean, socmean),
+#     by = "id"
+#   ) %>%
+#   transmute(
+#     latitude,
+#     longitude,
+#     soil_ph_sg = phh2omean,
+#     om_pct_sg = socmean * 0.1724
+#   )
+# 
+# soilgrid_fill_test 
+# 
+# write_csv(soilgrid_fill, "../output/soilgrid_fill_test.csv")
+```
+
+#### 6. Merge back
+
+```{r}
+
+soilgrid_fill_test <- read_csv("../output/soilgrid_fill_test.csv")
+
+test_soil_filled <- test_soil_full %>%
+  left_join(soilgrid_fill_test , by = c("latitude", "longitude")) %>%
+  mutate(
+    soil_ph = coalesce(soil_ph, soil_ph_sg),
+    om_pct  = coalesce(om_pct, om_pct_sg)
+  ) %>%
+  select(-soil_ph_sg, -om_pct_sg, -longitude, -latitude)
+
+test_soil_filled
+```
+
+```{r}
+# check NAs
+test_soil_filled %>%
+  summarise(
+    soil_ph_na = sum(is.na(soil_ph)),
+    om_pct_na  = sum(is.na(om_pct)),
+    soilk_ppm_na = sum(is.na(soilk_ppm)),
+    soilp_ppm_na = sum(is.na(soilp_ppm))
+  )
+```
+
+```{r}
+# label ones with SoilGrid data
+
+# test_soil_filled <- test_soil_full %>%
+#   left_join(soilgrid_fill, by = c("latitude", "longitude")) %>%
+#   mutate(
+#     soil_ph_from_sg = as.integer(is.na(soil_ph) & !is.na(soil_ph_sg)),
+#     om_pct_from_sg  = as.integer(is.na(om_pct)  & !is.na(om_pct_sg)),
+#     soil_ph = coalesce(soil_ph, soil_ph_sg),
+#     om_pct  = coalesce(om_pct, om_pct_sg)
+#   ) %>%
+#   select(-soil_ph_sg, -om_pct_sg)
+# 
+# test_soil_filled
+```
+
+```{r}
+# test_soil_filled2 <- test_soil_filled %>%
+#   mutate(
+#     site_base = str_remove(site, "\\d+$")
+#   ) %>%
+#   group_by(site_base) %>%
+#   mutate(
+#     soilk_base_mean = mean(soilk_ppm, na.rm = TRUE),
+#     soilp_base_mean = mean(soilp_ppm, na.rm = TRUE)
+#   ) %>%
+#   ungroup() %>%
+#   mutate(
+#     soilk_ppm = if_else(
+#       is.na(soilk_ppm) & is.finite(soilk_base_mean),
+#       soilk_base_mean,
+#       soilk_ppm
+#     ),
+#     soilp_ppm = if_else(
+#       is.na(soilp_ppm) & is.finite(soilp_base_mean),
+#       soilp_base_mean,
+#       soilp_ppm
+#     )
+#   ) %>%
+#   select(-site_base, -soilk_base_mean, -soilp_base_mean)
+# 
+# test_soil_filled2
+```
+
+```{r}
+# test_soil_filled2 %>%
+#   summarise(
+#     soilk_ppm_na = sum(is.na(soilk_ppm)),
+#     soilp_ppm_na = sum(is.na(soilp_ppm))
+#   )
+```
+
+```{r}
+# test_soil_filled %>%
+#   mutate(site_base = str_remove(site, "\\d+$")) %>%
+#   group_by(site_base) %>%
+#   summarise(
+#     n_site = n(),
+#     n_soilk_non_na = sum(!is.na(soilk_ppm)),
+#     n_soilp_non_na = sum(!is.na(soilp_ppm))
+#   ) %>%
+#   arrange(n_soilk_non_na, n_soilp_non_na)
+```
+
+```{r}
+# test_soil_compare <- test_soil_filled %>%
+#   select(site, year, soilk_ppm_old = soilk_ppm, soilp_ppm_old = soilp_ppm) %>%
+#   left_join(
+#     test_soil_filled2 %>%
+#       select(site, year, soilk_ppm_new = soilk_ppm, soilp_ppm_new = soilp_ppm),
+#     by = c("site", "year")
+#   ) %>%
+#   filter(
+#     (is.na(soilk_ppm_old) & !is.na(soilk_ppm_new)) |
+#     (is.na(soilp_ppm_old) & !is.na(soilp_ppm_new))
+#   )
+# 
+# train_soil_compare
+```
+
+### IV. Merge data
+
+#### 1. Check difference
+
+```{r}
+test_soil_filled %>% count(site, year) %>% filter(n > 1)
+test_meta_clean %>% count(site, year) %>% filter(n > 1)
+weather_test_month_sum_wide %>% count(site, year) %>% filter(n > 1)
+
+setdiff(test_trait_clean$site, weather_test_month_sum_wide$site)
+setdiff(test_trait_clean$site, test_soil_filled$site)
+setdiff(test_trait_clean$year, weather_test_month_sum_wide$year)
+setdiff(test_trait_clean$year, test_soil_filled$year)
+```
+
+#### 2. Left join
+
+```{r}
+test_data <- test_trait_clean %>%
+  left_join(weather_test_month_sum_wide, by = c("site", "year")) %>%
+  left_join(test_soil_filled, by = c("site", "year")) %>%
+  dplyr::select(-hybrid)
+
+test_data
+write_csv(test_data, "../output/test_data.csv")
+```
+
+#### 3. Check merged data
+
+```{r}
+# check row numbers
+nrow(test_trait_clean)
+nrow(test_data)
+
+# check if there is repeatedly join
+weather_test_month_sum_wide %>%
+  count(site, year) %>%
+  filter(n > 1)
+
+test_soil_clean %>%
+  count(site, year) %>%
+  filter(n > 1)
+
+# check NA
+test_data %>%
+  summarise(
+    n_weather_na = sum(is.na(mean_dayl.s_stage1)),
+    n_soil_na = sum(is.na(soil_ph))
+  )
+# Check which specific site has problem
+test_data %>%
+  filter(is.na(soil_ph)) %>%
+  distinct(site, year)
+```

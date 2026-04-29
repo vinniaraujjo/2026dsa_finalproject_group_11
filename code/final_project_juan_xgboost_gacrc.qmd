@@ -1,0 +1,495 @@
+---
+title: "final_project_Juan_ML"
+format: html
+editor: visual
+---
+
+Modelling
+
+# Ⅰ. Set up
+
+## 1. Install packages
+
+```{r}
+#| message: false
+#| warning: false
+
+.libPaths(c("/home/jg44526/R_lib_4.4.2/", .libPaths()))
+
+library(tidymodels)   
+library(finetune)     
+library(vip)          
+library(xgboost)      
+library(tidyverse)    
+library(doParallel)   
+library(lme4)        
+library(here)         
+library(quarto) 
+
+here::here()
+```
+
+## 2. Load data
+
+```{r}
+corn_data <- read_csv("../data/train_data.csv") %>%
+  mutate(year = as.factor(year))
+
+#glimpse(corn_data)
+```
+
+# II. XGBoost
+
+## 1. Pre-processing
+
+```{r}
+set.seed(123)
+corn_data_split <- initial_split(
+  corn_data, 
+  prop = .7, # proption of split same as previous codes
+  strata = yield_mg_ha_mean  # Stratify by target variable
+  )
+
+corn_data_split
+```
+
+### 1.1 Data split
+
+```{r}
+set.seed(123)
+corn_train <- training(corn_data_split)  # 70% of data
+corn_train #This is your training data frame
+
+corn_test <- testing(corn_data_split)    # 30% of data
+corn_test
+```
+
+### 1.2 Check target distribution
+
+```{r distribution}
+density_plot <- ggplot() +
+  geom_density(
+    data = corn_train,
+    aes(x = yield_mg_ha_mean),
+    color = "red"
+  ) +
+  geom_density(
+    data = corn_test,
+    aes(x = yield_mg_ha_mean),
+    color = "blue"
+  ) +
+  labs(
+    title = "Distribution of yield in train vs test",
+    x = "yield_mg_ha_mean",
+    y = "Density"
+  )
+
+density_plot
+
+cat("Saving...... density plot of train and test data\n")
+
+# Optional save
+# ggsave(
+#   plot = density_plot,
+#   path = here("output", "png"),
+#   filename = "density_plot_test_train.png",
+#   height = 6,
+#   width = 9,
+#   dpi = 600
+# )
+```
+
+### 1.3 Data processing with recipe
+
+```{r Check NAs}
+library(tibble)
+
+na_summary <- tibble(
+  column = names(corn_train),
+  na_ratio = colMeans(is.na(corn_train))
+) %>%
+  arrange(desc(na_ratio))
+
+na_summary
+```
+
+```{r}
+cat("\nCreate recipe for data preprocessing\n")
+
+corn_recipe <- recipe(yield_mg_ha_mean ~ ., data = corn_train) %>%
+  step_rm(site, year) %>%
+  step_unknown(previous_crop) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_indicate_na(all_of(c("om_pct", "soil_ph", "soilk_ppm", "soilp_ppm"))) %>%
+  step_nzv(all_predictors())
+
+# Prep the recipe to estimate any required statistics
+corn_prep <- corn_recipe %>% 
+  prep()
+
+# Examine preprocessing steps
+corn_prep
+
+```
+
+## 2. Training
+
+### 2.1 Model specification
+
+```{r xgb_spec}
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+xgb_spec
+```
+
+### 2.2 Resampling setup
+
+```{r}
+set.seed(123)
+
+# Create 10-fold cross-validation resampling object from training data
+ resampling_foldcv <- vfold_cv(corn_train, 
+                               v = 20,
+                               strata = yield_mg_ha_mean)
+ 
+# Create leave one year out cross-validation (cv) object from the sampling data
+# resampling_fold_loyo <- group_vfold_cv(corn_train,
+#                                        group = year)
+ 
+# Create leave one location out cv object from the sampling data
+# resampling_fold_loso <- group_vfold_cv(corn_train,
+#                                        group = site)
+```
+
+### 2.3 Hyperparameter grid with Latin Hypercube Sampling
+
+```{r }
+# Use prepped predictor data so mtry range matches processed columns better
+predictor_data <- bake(corn_prep, new_data = NULL) %>%
+  dplyr::select(-yield_mg_ha_mean)
+
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  learn_rate(),
+  trees(),
+  loss_reduction(),
+  sample_prop(),
+  finalize(mtry(), predictor_data),
+  size = 30
+)
+
+xgb_grid
+```
+
+```{r}
+ggplot(
+  data = xgb_grid,
+  aes(x = tree_depth, y = min_n)
+) +
+  geom_point(
+    aes(color = factor(learn_rate), size = trees),
+    alpha = 0.5,
+    show.legend = FALSE
+  )
+```
+
+```{r Workflow}
+xgb_wf <- workflow() %>%
+  add_recipe(corn_recipe) %>%
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+## 3. Detecting total cores
+
+-   This help us to detect the total number of available cores and then do a parallel processing on each of them
+
+```{r}
+# Detect Cores for Slurm (Cluster - Sapelo2)
+
+n_cores <- as.numeric(Sys.getenv("SLURM_CPUS_ON_NODE"))
+if (is.na(n_cores)) n_cores <- max(parallel::detectCores() - 1, 1)
+
+cl <- makePSOCKcluster(n_cores)
+registerDoParallel(cl)
+
+cat("Found and registered ", n_cores, " cores to work with\n")
+
+```
+
+## 4. Model Tuning
+
+```{r xgb_grid_result}
+set.seed(123)
+
+xgb_res <- tune_race_anova(
+  object = xgb_wf,
+  resamples = resampling_foldcv,
+  grid = xgb_grid,
+  metrics = metric_set(rmse, rsq),
+  control = control_race(
+    save_pred = TRUE,
+    verbose_elim = TRUE
+  )
+)
+
+# Stop cluster cleanly
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+Let's check the race results
+
+```{r}
+plot_race(xgb_res)
+collect_metrics(xgb_res)
+#saveRDS(xgb_res,"xgb_res.rds")
+xgb_res <- read_rds("/home/jg44526/2026_final_project/code/output_juan_modeling_1/xgb_res_juan_modeling.rds")
+```
+
+## 5. Select Best Models
+
+```{r}
+best_rmse <- select_best(xgb_res, metric = "rmse") %>%
+  mutate(source = "best_rmse")
+
+best_rmse_pct_loss <- select_by_pct_loss(
+  xgb_res,
+  min_n,
+  metric = "rmse",
+  limit = 1
+) %>%
+  mutate(source = "best_rmse_pct_loss")
+
+best_rsq <- select_best(xgb_res, metric = "rsq") %>%
+  mutate(source = "best_rsq")
+
+best_rsq_pct_loss <- select_by_pct_loss(
+  xgb_res,
+  min_n,
+  metric = "rsq",
+  limit = 1
+) %>%
+  mutate(source = "best_rsq_pct_loss")
+
+bind_rows(
+  best_rmse,
+  best_rmse_pct_loss,
+  best_rsq,
+  best_rsq_pct_loss
+) %>%
+  dplyr::select(source, everything())
+
+# Use RMSE winner as final choice
+best_params <- best_rmse %>%
+  dplyr::select(-source)
+
+best_params
+
+```
+
+## 6. Compare and Finalize Model
+
+```{r Finalized workflow}
+final_wf <- finalize_workflow(xgb_wf, best_params)
+
+final_wf
+```
+
+## 7. Resample final model
+
+```{r final_spec_fit}
+res_cv_final <- fit_resamples(
+  final_wf,
+  resamples = resampling_foldcv,
+  metrics = metric_set(rmse, rsq)
+)
+# # res_loyo_final <- fit_resamples(
+#   final_wf,
+#   resamples = resampling_fold_loyo,
+#   metrics = metric_set(rmse, rsq)
+# )
+# 
+# # res_loso_final <- fit_resamples(
+#   final_wf,
+#   resamples = resampling_fold_loso,
+#   metrics = metric_set(rmse, rsq)
+# )
+# saveRDS(res_cv_final, "res_cv_final.rds")
+res_cv_final<-read_rds("/home/jg44526/2026_final_project/code/output_juan_modeling_1/xgb_res_juan_modeling.rds")
+collect_metrics(res_cv_final)
+# collect_metrics(res_loyo_final)
+# collect_metrics(res_loso_final)
+```
+
+## 8. Final Fit and Predictions
+
+## Final validation on held-out test set
+
+```{r final_fit}
+
+set.seed(123)
+
+final_fit <- last_fit(final_wf, split = corn_data_split)
+
+saveRDS(final_fit,"./output_juan_modeling_1/final_fit.rds")
+
+final_preds <- final_fit %>%
+  collect_predictions()
+
+final_preds
+
+final_metrics <- final_fit %>%
+  collect_metrics()
+
+final_metrics
+```
+
+## 8. Fit on training set
+
+```{r}
+train_fit <- fit(final_wf, data = corn_train)
+
+train_pred <- augment(train_fit, new_data = corn_train)
+
+train_metrics <- metrics(
+  train_pred,
+  truth = yield_mg_ha_mean,
+  estimate = .pred
+)
+
+train_metrics
+
+```
+
+## 9. Predicted vs Observed Plot
+
+```{r}
+final_fit_plot <- final_preds %>%
+  ggplot(aes(x = yield_mg_ha_mean, y = .pred)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth(method = "lm", se = FALSE) +
+  coord_cartesian(xlim = c(1, 25), ylim = c(1, 25)) +
+  labs(
+    title = "Predicted vs Observed",
+    x = "Observed yield",
+    y = "Predicted yield"
+  )
+
+final_fit_plot
+
+# Optional save
+ ggsave(
+  plot = final_fit_plot,
+   path = here("output", "png"),
+   filename = "final_fit_plot_juan_model.png",
+   height = 6,
+   width = 9,
+   dpi = 300
+ )
+```
+
+## 10. Variable Importance
+
+```{r final_spec}
+# Extract fitted parsnip model first
+xgb_fit_obj <- extract_fit_parsnip(train_fit)
+
+vi_tbl <- vip::vi(xgb_fit_obj)
+
+saveRDS(vi_tbl, "./output_juan_modeling_1/vip.rds")
+
+# Full importance plot
+vi_tbl %>%
+  mutate(Variable = forcats::fct_reorder(Variable, Importance)) %>%
+  ggplot(aes(x = Importance, y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL, title = "Variable importance")
+
+# Top 20 importance plot
+final_vi_plot <- vi_tbl %>%
+  slice_max(order_by = Importance, n = 20) %>%
+  mutate(
+    Variable = stringr::str_trunc(Variable, width = 25),
+    Variable = forcats::fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(
+    y = NULL,
+    title = "Top 20 variable importance"
+  ) +
+  theme(axis.text.y = element_text(size = 8))
+
+final_vi_plot
+
+# Optional save
+ggsave(
+   plot = final_vi_plot,
+   path = here("./output_juan_modeling_1/vi", "png"),
+   filename = "final_spec_plot.png",
+   height = 6,
+   width = 9,
+   dpi = 600
+ )
+```
+
+```{r Save fitted final model}
+saveRDS(train_fit, "final_model.rds")
+```
+
+# 11. Predict external test_data
+
+```{r Build submission file}
+test_submission <- read_csv("../data/testing_submission.csv")
+
+test_out <- bind_cols(test_submission, pred_test) %>%
+  dplyr::select(-any_of("yield_mg_ha_mean")) %>%
+  rename(yield_mg_ha = .pred)
+
+write_csv(test_out, "../data/testing_submission_finished.csv")
+
+test_out
+```
+
+#Ming Revised \## Do test data Let's predict the test data
+
+```{r save model}
+# 1. Load real test data
+real_test <- read_csv("../data/test_data.csv") %>%
+  mutate(year = as.factor(year))
+
+# 2. Fit final model on ALL available training data
+# do not use corn_train，use full data: corn_data
+final_model <- fit(final_wf, data = corn_data)
+
+# 3. Predict real test data
+real_test_pred <- predict(final_model, new_data = real_test) %>%
+  bind_cols(real_test)
+
+real_test_pred
+```
+
+```{r save}
+write_csv(
+  real_test_pred,
+  "./output_juan_modeling_1/real_test_predictions.csv"
+)
+```

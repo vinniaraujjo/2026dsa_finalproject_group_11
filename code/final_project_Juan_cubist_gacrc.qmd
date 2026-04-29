@@ -1,0 +1,399 @@
+---
+title: "Cubist"
+format: html
+editor: visual
+---
+
+Cubist model
+
+```{r}
+# 1. Install/load package if needed
+#install.packages("Cubist")
+
+.libPaths(c("/home/jg44526/R_lib_4.4.2/", .libPaths()))
+
+library(tidymodels)
+library(finetune)
+library(vip)
+library(Cubist)
+library(tidyverse)
+library(doParallel)
+library(here)
+
+tidymodels_prefer()
+
+here::here()
+```
+
+```{r}
+# Load training data
+
+corn_data <- read_csv("../data/train_data.csv") %>%
+  mutate(year = as.factor(year))
+
+glimpse(corn_data)
+```
+
+```{r}
+# Train-test split
+
+set.seed(123)
+
+corn_data_split <- initial_split(
+  corn_data,
+  prop = 0.7,
+  strata = yield_mg_ha_mean
+)
+
+corn_train <- training(corn_data_split)
+corn_test <- testing(corn_data_split)
+
+corn_train
+corn_test
+```
+
+```{r}
+# Check target distribution
+
+ggplot() +
+  geom_density(
+    data = corn_train,
+    aes(x = yield_mg_ha_mean),
+    color = "red"
+  ) +
+  geom_density(
+    data = corn_test,
+    aes(x = yield_mg_ha_mean),
+    color = "blue"
+  ) +
+  labs(
+    title = "Distribution of yield in train vs test",
+    x = "yield_mg_ha_mean",
+    y = "Density"
+  )
+```
+
+```{r}
+# Recipe
+
+corn_recipe <- recipe(yield_mg_ha_mean ~ ., data = corn_train) %>%
+  step_rm(site, year) %>%
+  step_unknown(previous_crop) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_indicate_na(all_of(c("om_pct", "soil_ph", "soilk_ppm", "soilp_ppm"))) %>%
+  step_nzv(all_predictors())
+
+corn_recipe
+```
+
+```{r}
+# Cross-validation
+
+set.seed(123)
+
+resampling_foldcv <- vfold_cv(
+  corn_train,
+  v = 10,
+  strata = yield_mg_ha_mean
+)
+
+resampling_foldcv
+```
+
+```{r}
+# Cubist model specification
+
+cubist_spec <- cubist_rules(
+  committees = tune(),
+  neighbors = tune()
+) %>%
+  set_engine("Cubist") %>%
+  set_mode("regression")
+
+cubist_spec
+```
+
+```{r}
+# Workflow
+
+cubist_wf <- workflow() %>%
+  add_recipe(corn_recipe) %>%
+  add_model(cubist_spec)
+
+cubist_wf
+```
+
+```{r}
+# Tuning grid
+
+cubist_grid <- grid_regular(
+  committees(range = c(1, 100)),
+  neighbors(range = c(0, 9)),
+  levels = c(3, 3)
+)
+
+cubist_grid
+```
+
+```{r}
+# Parallel processing
+
+n_cores <- as.numeric(Sys.getenv("SLURM_CPUS_ON_NODE"))
+
+if (is.na(n_cores)) {
+  n_cores <- max(parallel::detectCores() - 1, 1)
+}
+
+cl <- makePSOCKcluster(n_cores)
+registerDoParallel(cl)
+
+cat("Found and registered", n_cores, "cores to work with\n")
+```
+
+```{r}
+# Tune Cubist model
+
+set.seed(123)
+
+cubist_res <- tune_race_anova(
+  object = cubist_wf,
+  resamples = resampling_foldcv,
+  grid = cubist_grid,
+  metrics = metric_set(rmse, rsq),
+  control = control_race(
+    save_pred = TRUE,
+    verbose_elim = TRUE,
+    parallel_over = "everything"
+  )
+)
+
+stopCluster(cl)
+registerDoSEQ()
+
+cubist_res
+```
+
+```{r}
+# Check tuning results
+
+collect_metrics(cubist_res)
+
+plot_race(cubist_res)
+
+saveRDS(
+  cubist_res,
+  "./output_juan_modeling_1/cubist_res.rds"
+)
+```
+
+```{r}
+# Select best model
+
+best_cubist_rmse <- select_best(
+  cubist_res,
+  metric = "rmse"
+)
+
+best_cubist_rsq <- select_best(
+  cubist_res,
+  metric = "rsq"
+)
+
+best_cubist_rmse
+best_cubist_rsq
+
+best_cubist_params <- best_cubist_rmse
+
+best_cubist_params
+```
+
+```{r}
+# Finalize workflow
+
+final_cubist_wf <- finalize_workflow(
+  cubist_wf,
+  best_cubist_params
+)
+
+final_cubist_wf
+```
+
+```{r}
+# Final validation on held-out test set
+
+set.seed(123)
+
+cubist_final_fit <- last_fit(
+  final_cubist_wf,
+  split = corn_data_split,
+  metrics = metric_set(rmse, rsq)
+)
+
+saveRDS(
+  cubist_final_fit,
+  "./output_juan_modeling_1/cubist_final_fit.rds"
+)
+
+cubist_final_metrics <- collect_metrics(cubist_final_fit)
+
+cubist_final_metrics
+```
+
+```{r}
+# Collect predictions
+
+cubist_final_preds <- collect_predictions(cubist_final_fit)
+
+cubist_final_preds
+```
+
+```{r}
+# Predicted vs observed plot
+
+cubist_final_fit_plot <- cubist_final_preds %>%
+  ggplot(aes(x = yield_mg_ha_mean, y = .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth(method = "lm", se = FALSE) +
+  coord_cartesian(xlim = c(1, 25), ylim = c(1, 25)) +
+  labs(
+    title = "Cubist Predicted vs Observed",
+    x = "Observed yield",
+    y = "Predicted yield"
+  )
+
+cubist_final_fit_plot
+
+ggsave(
+  plot = cubist_final_fit_plot,
+  path = here("./output_juan_modeling_1", "png"),
+  filename = "cubist_predicted_vs_observed.png",
+  height = 6,
+  width = 9,
+  dpi = 300
+)
+```
+
+```{r}
+# Fit Cubist on training set for variable importance
+
+cubist_train_fit <- fit(
+  final_cubist_wf,
+  data = corn_train
+)
+
+cubist_train_pred <- augment(
+  cubist_train_fit,
+  new_data = corn_train
+)
+
+cubist_train_metrics <- metrics(
+  cubist_train_pred,
+  truth = yield_mg_ha_mean,
+  estimate = .pred
+)
+
+cubist_train_metrics
+```
+
+```{r}
+# Variable importance
+
+cubist_fit_obj <- extract_fit_parsnip(cubist_train_fit)
+
+cubist_vi_tbl <- vip::vi(cubist_fit_obj)
+
+saveRDS(
+  cubist_vi_tbl,
+  "./output_juan_modeling_1/cubist_vip.rds"
+)
+
+cubist_vi_tbl
+```
+
+```{r}
+# Top 20 variable importance plot
+
+cubist_vi_plot <- cubist_vi_tbl %>%
+  slice_max(order_by = Importance, n = 20) %>%
+  mutate(
+    Variable = stringr::str_trunc(Variable, width = 25),
+    Variable = forcats::fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(
+    y = NULL,
+    title = "Cubist Top 20 Variable Importance"
+  ) +
+  theme(axis.text.y = element_text(size = 8))
+
+cubist_vi_plot
+
+ggsave(
+  plot = cubist_vi_plot,
+  path = here("./output_juan_modeling_1/vi", "png"),
+  filename = "cubist_variable_importance.png",
+  height = 6,
+  width = 9,
+  dpi = 600
+)
+```
+
+```{r}
+# Fit final Cubist model on ALL training data
+
+final_cubist_model <- fit(
+  final_cubist_wf,
+  data = corn_data
+)
+
+saveRDS(
+  final_cubist_model,
+  "./output_juan_modeling_1/final_cubist_model.rds"
+)
+```
+
+```{r}
+# Predict real 2024 test data
+
+real_test <- read_csv("../data/test_data.csv") %>%
+  mutate(year = as.factor(year))
+
+real_test_cubist_pred <- predict(
+  final_cubist_model,
+  new_data = real_test
+) %>%
+  bind_cols(real_test)
+
+real_test_cubist_pred
+```
+
+```{r}
+# Save real test predictions
+
+write_csv(
+  real_test_cubist_pred,
+  "./output_juan_modeling_1/real_test_cubist_predictions.csv"
+)
+```
+
+```{r}
+# Build submission file
+
+test_submission <- read_csv("../data/testing_submission.csv")
+
+cubist_submission <- test_submission %>%
+  mutate(
+    yield_mg_ha = real_test_cubist_pred$.pred
+  )
+
+cubist_submission
+
+write_csv(
+  cubist_submission,
+  "../data/testing_submission_cubist_finished.csv"
+)
+```
