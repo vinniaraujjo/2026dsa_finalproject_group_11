@@ -1,0 +1,315 @@
+---
+title: "Weather_Pull_Vinicius"
+format: html
+editor: visual
+---
+
+## 1. Code
+
+### a. Packages
+
+```{r Packages}
+#/ message: false
+#/ warning: false
+
+library(tidyverse)
+library(daymetr)
+library(USAboundaries)
+library(sf)
+library(dplyr)
+library(stringr)
+```
+
+### b. Reading CSVs
+
+```{r Trait Data}
+trait_data <- read.csv("../data/training/training_trait.csv")
+
+trait_data <- trait_data %>%
+  mutate(site = str_extract(site, "^[A-Z]+[0-9]+"),
+         site = toupper(site))
+
+```
+
+```{r Soil Data}
+soil_data <- read.csv("../data/training/training_soil.csv")
+
+soil_data <- soil_data %>%
+  mutate(
+    # Remove underscore followed by any digits (e.g., _2015)
+    site = str_remove(site, "_[0-9]+"),
+    # Then apply the regex to remove letters after numbers (e.g., IAH1A -> IAH1)
+    site = str_extract(site, "^[A-Z]+[0-9]+"),
+    site = toupper(site)
+  )
+```
+
+```{r Partially_Join_Trait_Soil_Datas}
+all_data <- full_join(trait_data, soil_data, by = c("site","year"))
+```
+
+```{r Meta Data}
+meta_data <- read.csv("../data/training/training_meta.csv")
+
+  meta_data <- meta_data %>%
+  mutate(site = str_extract(site, "^[A-Z]+[0-9]+"),
+         site = toupper(site)) %>%
+select(site, latitude, longitude) %>%
+  distinct()
+```
+
+```{r Final_Data_Join}
+final_data <- left_join(all_data, meta_data, by = "site") %>%
+  select(year, site, hybrid, yield_mg_ha:longitude)
+```
+
+### c. Checking Data
+
+# Exploratory Data Analysis (EDA)
+
+```{r EDA}
+summary(final_data)
+```
+
+```{r Boundaries_of_States}
+states <- us_states() %>%
+  filter(!(state_abbr %in% c("PR","AK","HI")))
+
+ggplot() +
+  geom_sf(data = states) +
+  geom_point(data = final_data,
+             aes(x = longitude,
+                 y = latitude) # add a comma and color = variable of interest
+             )
+```
+
+```{r Find__PositiveLongitude_Outliers}
+outlier_sites <- final_data %>%
+  filter(longitude > 0) %>%
+  distinct(site, latitude, longitude)
+print(outlier_sites)
+```
+
+```{r Filter_out_global_outliers_and_NAs}
+final_data <- final_data %>%
+  filter(longitude < -60) %>% # Keeps only Western Hemisphere points
+  filter(!is.na(latitude))    # Removes the 710 rows with missing coords
+```
+
+```{r Final_checking_before_pulling_Daymet_data}
+summary(final_data)
+```
+
+### d. Weather data pull
+
+```{r Testing_Opening_API_Data}
+#help("download_daymet")
+daymet_one <- download_daymet(site = final_data$site[1],
+                              lat = final_data$latitude[1],
+                              lon = final_data$longitude[1],
+                              start = final_data$year[1],
+                              end = final_data$year[1],
+                              simplify = T # table in the end
+                              )
+
+```
+
+```{r Pivot_Wider_Function}
+daymet_one %>%
+  pivot_wider(names_from = measurement,
+              values_from = value)
+```
+
+```{r}
+summary(daymet_one)
+```
+
+```{r Find_Unmatched_Data}
+qc_check <- trait_data %>%
+  left_join(meta_data, by = "site") %>%
+  filter(is.na(latitude)) %>%
+  distinct(site)
+
+if(nrow(qc_check) > 0) {
+  warning("The following sites still have no coordinates:")
+  print(qc_check)
+} else {
+  message("All sites matched! Ready for Daymet.")
+}
+```
+
+```{r Too heavy to my laptop}
+daymet_all <- final_data %>%
+  mutate(weather = pmap(list(.y = year,
+                             .site = site,
+                             .lat = latitude,
+                             .lon = longitude),
+                        function(.y, .site, .lat, .lon)
+                          download_daymet(
+                            site = .site,
+                            lat = .lat,
+                            lon = .lon,
+                            start = .y,
+                            end = .y,
+                            simplify = T,
+                            silent = T 
+                          ) %>%
+                          rename(.year = year,
+                                 .site = site
+                                 )
+                        ))
+daymet_all %>% head()
+```
+
+```{r Checking whether it looks good}
+daymet_all$weather[1]
+```
+
+### e. Data Wrangling before feature engineering
+
+```{r Data preparing for wrangling}
+daymet_all_unnest <- daymet_all %>%
+  unnest(weather) %>%
+  pivot_wider(names_from = measurement,
+              values_from = value) %>%
+  janitor::clean_names()
+daymet_all_unnest
+```
+
+### f. Exporting CSV
+
+```{r}
+write_csv(daymet_all_unnest,"../data/trainingdata_vinicius.csv")
+```
+
+---
+title: "feature_eng_Vinicius"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+```
+
+```{r}
+trait_data <- read.csv("../data/training/training_trait.csv")
+
+trait_data1 <- trait_data %>%
+  mutate(site = str_extract(site, "^[A-Z]+[0-9]+"),
+         site = toupper(site)) %>%
+  group_by(site, year, hybrid) %>%
+  summarise(
+    yield_mg_ha_mean = mean(yield_mg_ha, na.rm = TRUE), 
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+soil_data <- read.csv("../data/training/training_soil.csv")
+
+soil_data1 <- soil_data %>%
+  mutate(
+    # Remove underscore followed by any digits (e.g., _2015)
+    site = str_remove(site, "_[0-9]+"),
+    # Then apply the regex to remove letters after numbers (e.g., IAH1A -> IAH1)
+    site = str_extract(site, "^[A-Z]+[0-9]+"),
+    site = toupper(site)
+  )
+```
+
+```{r}
+soil_clean <- soil_data1 %>%
+  group_by(site, year) %>%
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+```
+
+```{r}
+all_data <- trait_data1 %>%
+left_join(soil_clean, by = c("site","year"))
+```
+
+```{r}
+meta_data <- read.csv("../data/training/training_meta.csv")
+
+  meta_data1 <- meta_data %>%
+  mutate(site = str_extract(site, "^[A-Z]+[0-9]+"),
+         site = toupper(site)) %>%
+    distinct(site, year, .keep_all = TRUE) 
+```
+
+```{r}
+final_dataset <- all_data %>%
+left_join(meta_data1, by = c("site", "year"))
+```
+
+```{r}
+summary(final_dataset)
+```
+
+## 2. Feature engineering
+
+```{r}
+feature_data <- read.csv("../data/ready_data/full_data_daym.csv")
+```
+
+```{r}
+summary(feature_data)
+```
+
+### a. Feature Engineering
+
+```{r Defining growing stages according to the crop development}
+weather_data <- feature_data %>%
+  filter(yday >= 60 & yday <= 334) %>%
+  mutate(stage = case_when(
+    yday >= 60 & yday <= 128 ~ "stage1",
+    yday > 128  & yday <= 196 ~ "stage2",
+    yday > 196  & yday <= 264 ~ "stage3",
+    yday > 264  & yday <= 334 ~ "stage4"
+  )) %>%
+  group_by(site, year, stage) %>%
+  summarise(
+    sum_prcp_mm     = sum(prcp_mm_day, na.rm = TRUE),
+    sum_heat_stress = sum(tmax_deg_c > 30, na.rm = TRUE),
+    sum_gdd         = sum(pmax(((tmax_deg_c + tmin_deg_c) / 2) - 10, 0), na.rm = TRUE),
+    mean_tmax       = mean(tmax_deg_c, na.rm = TRUE),
+    mean_tmin       = mean(tmin_deg_c, na.rm = TRUE),
+    mean_srad       = mean(srad_w_m_2, na.rm = TRUE),
+    mean_vp         = mean(vp_pa, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  
+  pivot_wider(
+    names_from = stage,
+    values_from = c(starts_with("sum_"), starts_with("mean_")),
+    names_glue = "{.value}_{stage}"
+  )%>%
+  
+  mutate(site = str_extract(site, "^[A-Z]+[0-9]+"),
+         site = toupper(site))
+
+master_training_data <- final_dataset %>%
+  inner_join(weather_data, by = c("site", "year"))
+
+nrow(master_training_data)
+```
+
+```{r Checking variables}
+summary(master_training_data)
+```
+
+```{r Including weather and other variables at the time table}
+weatherdata_ML <- master_training_data %>%
+  select(site, year, previous_crop, hybrid, yield_mg_ha_mean:soilp_ppm, sum_prcp_mm_stage1:mean_vp_stage4)
+```
+
+```{r}
+summary(weatherdata_ML)
+```
+
+```{r}
+write_csv(weatherdata_ML,"../data/trainingdata_vinicius.csv")
+```

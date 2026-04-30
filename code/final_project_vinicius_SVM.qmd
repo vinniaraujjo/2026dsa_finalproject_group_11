@@ -1,0 +1,385 @@
+---
+title: "SVM_model_Vinicius"
+format: html
+editor: visual
+---
+
+# OnDemand packages
+
+```{r}
+shared_lib_path <- "/work/crss8030/vfa43171/shared_R_ribs"
+
+#class_packages <- c("tidymodels","tidyverse","vip","ranger","finetune", "parnship", "reticulate", xgboost, "doParallel", "lme4", "here")
+
+#install.packages(c("lmer4", "noplr"), lib = shared_lib_path, type = "source")
+```
+
+```{r}
+.libPaths(c("/work/crss8030/vfa43171/shared_R_ribs", .libPaths()))
+```
+
+## Library
+
+```{r}
+#| message: false
+#| warning: false
+#install.packages("earth") #new pacakage
+library(tidymodels)   # Core framework for modeling (includes recipes, workflows, parsnip, etc.)
+library(finetune)     # Additional tuning strategies (e.g., racing, ANOVA-based tuning)
+library(vip)          # For plotting variable importance from fitted models
+library(kernlab)      
+library(ranger)       # Fast implementation of Random Forests
+library(tidyverse)    # Data wrangling and visualization
+library(doParallel)   # For parallel computing (useful during resampling/tuning)
+library(caret)       # Other great library for Machine Learning 
+library(glmnet)
+```
+
+# Load the data set
+
+```{r}
+weather_training <- read_csv("../data/ML_data_Vinicius/trainingdata_vinicius.csv") 
+```
+
+# ML Workflow SVM MODEL
+
+## 1. Pre-processing
+
+```{r}
+set.seed(2026)
+weather_split <- initial_split(
+  weather_training,
+  prop = 0.7,
+  strata = yield_mg_ha_mean
+)
+weather_split
+```
+
+### a. Data split
+
+For a data split, I will use **70% training / 30 % testing**
+
+```{r corn_train}
+corn_train <- training(weather_split) #70% of data
+corn_train
+```
+
+```{r corn_test}
+corn_test <- testing(weather_split)
+corn_test
+```
+
+### b. Distribution of target variable
+
+```{r}
+ggplot() +
+  geom_density(data = corn_train,
+               aes(x = yield_mg_ha_mean),
+               color = "red") +
+  geom_density(data = corn_test,
+               aes(x = yield_mg_ha_mean),
+               color = "blue")
+```
+
+### c. Recipe
+
+```{r SVM recipe}
+corn_recipe <- recipe(yield_mg_ha_mean ~ ., data = corn_train) %>%
+  step_rm(year) %>%
+  step_novel(all_nominal_predictors())%>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors())
+corn_recipe
+```
+
+```{r}
+corn_prep <- corn_recipe %>%
+  prep()
+
+corn_prep
+```
+
+## 2. Training
+
+### a. Model Specification
+
+```{r SVM Model Specification}
+svm_spec <- svm_rbf(
+  cost      = tune(),
+  rbf_sigma = tune()) %>%
+  
+  set_engine("kernlab") %>%
+  set_mode("regression")
+svm_spec
+```
+
+### b. Cross-validation setup
+
+```{r Cross-Validation SVM}
+set.seed(2026)
+resampling_foldcv <- vfold_cv(corn_train, v=5) #It should be 10.
+
+resampling_foldcv
+resampling_foldcv$splits[[1]]
+```
+
+```{r Defining Workflow}
+#svm_wf <- workflow() %>%
+ # add_recipe(corn_recipe) %>%
+  #add_model(svm_spec)
+```
+
+```{r Model Workflow}
+final_workflow <- workflow() %>%
+  add_recipe(corn_recipe) %>%
+  add_model(final_spec) %>%
+  finalize_workflow(best_rmse)
+```
+
+### c. Hyperparameter grid
+
+```{r}
+svm_grid <- grid_latin_hypercube(
+  cost(),
+  rbf_sigma(),
+  size = 5)  # Ideally over 100
+
+svm_grid
+```
+
+## 3. Model Tuning
+
+```{r}
+set.seed(2026)
+registerDoParallel(cores = parallel::detectCores() -1)
+
+svm_res <- tune_race_anova(object = svm_spec,
+                      preprocessor = corn_recipe,
+                      resamples = resampling_foldcv,
+                      grid = svm_grid,
+                      control = control_race(save_pred = T))
+stopImplicitCluster()
+
+beepr::beep()
+svm_res$.metric[[2]]
+```
+
+```{r}
+plot_race(svm_res)
+```
+
+## 4. Select Best Models
+
+```{r}
+# Based on lowest RMSE
+best_rmse <- svm_res %>%
+  select_best(metric = "rmse")
+
+best_rmse
+```
+
+```{r}
+# Based on lowers RMSE within 1% loss
+best_rmse_pct_loss <- svm_res %>%
+  select_by_pct_loss("cost",
+                     metric = "rmse",
+                     limit = 1) %>%
+  mutate(source = "best_rmse_pct_loss")
+
+best_rmse_pct_loss
+```
+
+```{r}
+# Based on lowest RMSE within 1 se
+best_rmse_one_std_err <- svm_res %>% 
+  select_by_one_std_err(metric = "rmse",
+                        eval_time = 100,
+                        cost
+                        )%>% 
+  mutate(source = "best_rmse_one_std_err")
+
+best_rmse_one_std_err
+```
+
+```{r}
+# Based on greatest R2
+best_r2 <- svm_res %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2")
+
+best_r2
+```
+
+```{r}
+# Based on lowers R2 within 1% loss
+best_r2_pct_loss <- svm_res %>% 
+  select_by_pct_loss("cost",
+                     metric = "rsq",
+                     limit = 1
+                     ) %>% 
+  mutate(source = "best_r2_pct_loss")
+
+best_r2_pct_loss
+```
+
+```{r}
+# Based on lowest R2 within 1 se
+best_r2_one_std_error <- svm_res %>% 
+  select_by_one_std_err(metric = "rsq",
+                        eval_time = 100,
+                        cost
+                        ) %>%
+  mutate(source = "best_r2_one_std_error")
+
+best_r2_one_std_error
+```
+
+```{r Comparing best}
+best_rmse %>% 
+  bind_rows(best_rmse_pct_loss, 
+            best_rmse_one_std_err, 
+            best_r2, 
+            best_r2_pct_loss, 
+            best_r2_one_std_error) %>%
+  mutate(source, everything())
+```
+
+## 5. Final Specification
+
+```{r}
+final_spec <- svm_rbf(
+  cost = best_r2$cost,
+  rbf_sigma = best_r2$rbf_sigma
+) %>%
+  set_engine("kernlab", eps = best_r2$eps) %>%
+  set_mode("regression")
+
+final_spec
+```
+
+## 6. Final Fit and Predictions
+
+## Validation
+
+```{r}
+set.seed(2026)
+final_fit <- last_fit(final_spec,
+                corn_recipe,
+                split = weather_split)
+```
+
+## 7. Evaluate on Test Set
+
+```{r}
+final_fit %>%
+  collect_predictions()
+```
+
+## 8. Evaluate on Training Set
+
+```{r}
+final_spec %>%
+  fit(yield_mg_ha_mean ~ .,
+      data = bake(corn_prep, 
+                  corn_train)) %>%
+  augment(new_data = bake(corn_prep, 
+                          corn_train)) %>% 
+  rmse(yield_mg_ha_mean, .pred) %>%
+  bind_rows(
+    
+# R2
+final_spec %>%
+  fit(yield_mg_ha_mean ~ .,
+      data = bake(corn_prep, 
+                  corn_train)) %>%
+  augment(new_data = bake(corn_prep, 
+                          corn_train)) %>% 
+  rsq(yield_mg_ha_mean, .pred)
+  )
+```
+
+## 9. Predicted vs Observed Plot
+
+```{r}
+final_fit %>%
+  collect_predictions() %>%
+  ggplot(aes(x = yield_mg_ha_mean,
+             y = .pred)) +
+  geom_point() +
+  geom_abline() +
+  geom_smooth(method = "lm") +
+  scale_x_continuous(limits = c(0, 40)) +
+  scale_y_continuous(limits = c(0, 40)) 
+```
+
+```{r}
+publication_ready <- final_fit %>%
+  collect_predictions() %>%
+  ggplot(aes(x = yield_mg_ha_mean,
+             y = .pred)) +
+
+  geom_point(aes(fill = yield_mg_ha_mean), shape = 21, alpha = 0.7, show.legend = F) +
+  
+  scale_fill_viridis_c(option = "H") +
+  
+  geom_abline(color = "red", linetype = 2) +
+  
+  geom_smooth(method = "lm") +
+  labs(x = "Observed Yield (Mg/Ha)",
+       y = "Predicted Yield (Mg/Ha)")+
+  
+  annotate("label", x = Inf, y = -Inf,
+           label = paste0(
+             "R²: ", test_met$estimate[test_met$.metric == "rsq"],
+             "\nRMSE: ", test_met$estimate[test_met$.metric == "rmse"]),
+           hjust = 1, vjust = -0.5) +
+  
+  scale_x_continuous(limits = c(0, 40)) +
+  scale_y_continuous(limits = c(0, 40)) +
+  
+  # Changing the theme of the plot
+    theme(panel.background = element_rect(fill = "gray82"))
+
+ggsave(plot = publication_ready, 
+       path = ("../output/"),
+       filename = "publication_readySVM.png",
+       height = 6,
+       width = 9,
+       dpi = 600)
+```
+
+## 10. Applying on 2024 test set
+
+### a. Loading 2024 dataset
+
+```{r}
+weather_features <- read.csv("../data/ML_data_Vinicius/testingdata_vinicius.csv") 
+```
+
+```{r}
+final_workflow_model <- final_workflow %>%
+  fit(data = corn_train)
+```
+
+### b. Prediction
+
+```{r}
+predict_2024 <- predict(final_workflow_model, new_data = weather_features) %>%
+bind_cols(weather_features %>% select(site, year, hybrid)) %>%
+  rename(yield_mg_ha = .pred)
+```
+
+```{r}
+final_answer <- test_submission %>%
+  mutate(yield_mg_ha = predict_2024$yield_mg_ha)
+```
+
+### c. Exporting CSV file
+
+```{r}
+write_csv(final_answer, "../output/Yield_Predictions_2024.csv")
+```
+
+```{r}
+#knitr::purl("SVM_model_Vinicius.qmd", output = "sapelo_scriptSVM.R", documentation = 0)
+```
